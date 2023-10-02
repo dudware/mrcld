@@ -1,0 +1,12 @@
+[Unit]
+Description=MQTT Remote Control for Linux Desktop
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/mrcld
+WorkingDirectory=
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

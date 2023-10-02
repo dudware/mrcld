@@ -1,0 +1,7 @@
+[Desktop Entry]
+Exec=nohup /usr/bin/mrcld > /dev/null 2>&1 &
+Icon=
+Name=mrcld
+Path=
+Terminal=False
+Type=Application

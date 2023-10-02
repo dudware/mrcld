@@ -1,0 +1,401 @@
+#!/bin/python3
+import paho.mqtt.client as mqtt
+import os
+import socket
+import getpass
+import logging
+import time
+import dbus
+import subprocess
+import configparser
+import argparse
+
+hostname = socket.gethostname()
+username = getpass.getuser()
+
+def load_config(config_file):
+    config = configparser.ConfigParser()
+    config.read(config_file)
+
+    # Logger settings
+    log_dir = config.get('General', 'log_dir')
+    globals()["log_file"] = f"{log_dir}/daemon-{username}.log"
+
+    log_level_string = config.get('General', 'log_level', fallback="info").upper()
+    log_levels = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+        'CRITICAL': logging.CRITICAL
+    }
+    if log_level_string in log_levels:
+        globals()["log_level"] = log_levels[log_level_string]
+    else:
+        globals()["log_level"] = logging.WARNING  # Alapértelmezett logszint, ha a beolvasott érték érvénytelen
+
+
+    # Dbus setup
+    if username != "root":
+        globals()["session_bus"] = dbus.SessionBus()
+
+
+    # HomeAssistant settings
+    globals()["ha_discovery_topic_prefix"] = config.get('General', 'ha_discovery_topic_prefix', fallback='homeassistant')
+    globals()["ha_device_name"] =  config.get('General', 'ha_device_name', fallback=f'{hostname}')
+    globals()["ha_device"] = f'\u007b"identifiers": ["{ha_device_name}"],"name": "{ha_device_name}"\u007d'
+
+
+    # MQTT settings
+    globals()["mqtt_client"] = mqtt.Client()
+
+    mqtt_username = config.get('MQTT', 'username')
+    mqtt_password = config.get('MQTT', 'password')
+    mqtt_client.username_pw_set(mqtt_username, mqtt_password)  # Felhasználónév-jelszó hitelesítés beállítása
+
+    globals()["broker_address"] = config.get('MQTT', 'host')
+    globals()["cmnd_topic"] = f"mrcld/cmnd/{ha_device_name}/{username}"
+    globals()["stat_topic"] = f"mrcld/stat/{ha_device_name}/{username}"
+    
+
+    # Function: ScreenLock
+    if config.get('Function.ScreenLock', 'enable').lower() == "true":
+        globals()["screenlock_enabled"] = True
+        globals()["prev_lock_status"] = None
+        if config.get('Function.ScreenLock', 'ha_discovery').lower() == "true":
+            globals()["screenlock_ha_discovery_enabled"] = True
+        else:
+            globals()["screenlock_ha_discovery_enabled"] = False
+    else:
+        globals()["screenlock_enabled"] = False
+        globals()["screenlock_ha_discovery_enabled"] = False
+        
+    # Function: ScreenBacklight
+    if config.get('Function.ScreenBacklight', 'enable').lower() == "true":
+        globals()["screenbacklight_enabled"] = True
+        globals()["prev_screenbacklight_status"] = None
+        if config.get('Function.ScreenBacklight', 'ha_discovery').lower() == "true":
+            globals()["screenbacklight_ha_discovery_enabled"] = True
+        else:
+            globals()["screenbacklight_ha_discovery_enabled"] = False
+    else:
+        globals()["screenbacklight_enabled"] = False
+        globals()["screenbacklight_ha_discovery_enabled"] = False
+
+
+    # Function: AudioVolume
+    if config.get('Function.AudioVolume', 'enable').lower() == "true":
+        globals()["audiovolume_enabled"] = True
+        globals()["prev_audiovolume_status"] = None
+        if config.get('Function.AudioVolume', 'ha_discovery').lower() == "true":
+            globals()["audiovolume_ha_discovery_enabled"] = True
+        else:
+            globals()["audiovolume_ha_discovery_enabled"] = False
+
+    else:
+        globals()["audiovolume_enabled"] = False
+        globals()["audiovolume_ha_discovery_enabled"] = False
+
+        
+    # Function: Shutdown
+    if config.get('Function.Shutdown', 'enable').lower() == "true":
+        globals()["shutdown_enabled"] = True
+        if config.get('Function.Shutdown', 'ha_discovery').lower() == "true":
+            globals()["shutdown_ha_discovery_enabled"] = True
+        else:
+            globals()["shutdown_ha_discovery_enabled"] = False
+    else:
+        globals()["shutdown_enabled"] = False
+        globals()["shutdown_ha_discovery_enabled"] = False
+
+
+def get_ha_discovery_topic(component, function):
+    global ha_discovery_topic_prefix
+    global ha_device_name
+    topic = f"{ha_discovery_topic_prefix}/{component}/{function}/{ha_device_name}/config"
+    return topic
+
+# Az üzenet érkezésekor végrehajtandó függvény
+def on_message(client, userdata, message):
+    # Az MQTT üzenet tartalmát konvertáljuk szövegbe
+    command = message.payload.decode("utf-8")
+    topic = message.topic.replace(cmnd_topic, '')
+    logging.info(f"Received on: {cmnd_topic}{topic} \"{command}\"")
+
+    # Itt végrehajtjuk a parancsot
+    match (topic):
+        case "/screenlock":
+            if screenlock_enabled:
+                cmnd_screenlock(command)
+        case "/screenbacklight":
+            if screenbacklight_enabled:
+                cmnd_screenbacklight(command)
+        case "/volume":
+            if audiovolume_enabled:
+                cmnd_volume(command)
+        case "/notify":
+            cmnd_notify(command)
+        case "/shutdown":
+            if shutdown_enabled:
+                cmnd_shutdown()
+
+# Screenlock functions          
+def cmnd_screenlock(command):
+    logging.debug(f"cmnd_screenlock() started")
+    logging.debug(f"cmnd_screenlock() @ command = {command}")
+    match (command):
+        case "1":
+            logging.info(f"Lock screen.")
+            os.system("loginctl lock-session")
+        case "0":
+            logging.info(f"Unlock screen.")
+            os.system("loginctl unlock-session")
+
+def stat_screenlock():
+    logging.debug(f"stat_screenlock() started")
+ 
+    global prev_lock_status
+    logging.debug(f"stat_screenlock() @ prev_lock_status = {prev_lock_status}")
+
+    topic = f"{stat_topic}/screenlock"
+    logging.debug(f"stat_screenlock() @ topic = {topic}")
+
+    screensaver_proxy = session_bus.get_object('org.freedesktop.ScreenSaver', '/org/freedesktop/ScreenSaver')
+    is_locked = screensaver_proxy.GetActive(dbus_interface='org.freedesktop.ScreenSaver')
+    logging.debug(f"stat_screenlock() @ is_locked = {is_locked}")
+    
+    # Is screenlock status changed?
+    if is_locked != prev_lock_status:
+        prev_lock_status = is_locked
+        lock_status = "locked" if is_locked else "unlocked"
+        logging.info(f"Screen {lock_status}")
+        mqtt_client.publish(topic, is_locked, retain=True)
+        logging.info(f"Published to: {topic} \"{is_locked}\"")
+
+def homeassistant_discovery_screenlock():
+    logging.debug(f"homeassistant_discovery_screenlock() started")
+    
+    topic = get_ha_discovery_topic("switch", "screenlock")
+    logging.debug(f"homeassistant_discovery_screenlock() @ topic = {topic}")
+
+    message = f'\u007b"name": "screenlock", "device_class": "switch", "state_topic": "{stat_topic}/screenlock", "command_topic": "{cmnd_topic}/screenlock", "icon": "mdi:monitor-lock", "payload_on": "1", "payload_off": "0", "optimistic": "true", "unique_id": "{hostname}_screenlock", "device": {ha_device}\u007d'
+    logging.debug(f"homeassistant_discovery_screenlock() @ message = {message}")
+    
+    mqtt_client.publish(topic, message, retain=True)
+    logging.info(f"HomeAssistant discovery message sent with screenlock config")
+
+# Screen backlight functions
+def cmnd_screenbacklight(command):
+    logging.debug(f"cmnd_screenbacklight() started")
+    logging.debug(f"cmnd_screenbacklight() @ command = {command}")
+    match (command):
+        case "1":
+            logging.info(f"Turn on screen.")
+            os.system("xset -display :0 dpms force on")
+        case "0":
+            logging.info(f"Turn off screen.")
+            os.system("xset -display :0 dpms force off")
+
+def stat_screenbacklight():
+    logging.debug(f"stat_screenbacklight() started")
+    
+    global prev_screenbacklight_status
+    logging.debug(f"stat_screenbacklight() @ prev_screenbacklight_status = {prev_screenbacklight_status}")
+
+    topic = f"{stat_topic}/screenbacklight"
+    logging.debug(f"stat_screenbacklight() @ topic = {topic}")
+    
+    xsetq_output = subprocess.check_output("/usr/bin/xset q -display :0 | { /usr/bin/grep Monitor || true; }", shell=True, universal_newlines=True).replace('  Monitor is ', '').strip().lower()
+    logging.debug(f"stat_screenbacklight() @ xsetq_output = {xsetq_output}")
+    
+    match (xsetq_output):
+        case "on":
+            backlight_status = "1"
+        
+        case "off":
+            backlight_status = "0"
+        
+        case _:
+            backlight_status = None
+    logging.debug(f"stat_screenbacklight() @ backlight_status = {backlight_status}")
+    
+    # Is screen blacklight status changed?             
+    if backlight_status != prev_screenbacklight_status:
+        prev_screenbacklight_status = backlight_status
+        logging.info(f"Screen backlight is {xsetq_output}")
+        mqtt_client.publish(topic, backlight_status, retain=True)
+        logging.info(f"Published to: {topic} \"{backlight_status}\"")
+        
+def homeassistant_discovery_screenbacklight():
+    logging.debug(f"homeassistant_discovery_screenbacklight() started")
+    
+    topic = get_ha_discovery_topic("switch", "screenbacklight")
+    logging.debug(f"homeassistant_discovery_screenbacklight() @ topic = {topic}")
+
+    message = f'\u007b"name": "screenbacklight", "device_class": "switch", "state_topic": "{stat_topic}/screenbacklight", "command_topic": "{cmnd_topic}/screenbacklight", "icon": "mdi:monitor-shimmer", "payload_on": "1", "payload_off": "0", "optimistic": "true", "unique_id": "{hostname}_screenbacklight", "device": {ha_device}\u007d'
+    logging.debug(f"homeassistant_discovery_screenbacklight() @ message = {message}")
+    
+    mqtt_client.publish(topic, message, retain=True)
+    logging.info(f"HomeAssistant discovery message sent with screenbacklight config")
+        
+# Audio volume functions          
+def cmnd_volume(command):
+    logging.debug(f"cmnd_volume() started")
+    logging.debug(f"cmnd_volume() @ command = {command}")
+    try:
+        volume = int(command)
+        if 0 <= volume <= 100:
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{volume}%"])
+            logging.info(f"Audio volume set to {volume}%")
+        else:
+            logging.warning("Audio volume have to be between 0 and 100")
+    except ValueError:
+        logging.warning("Invalid audio volume value. Have to be a number")
+
+def stat_volume():
+    logging.debug(f"stat_volume() started")
+    
+    global prev_audiovolume_status
+    logging.debug(f"stat_volume() @ prev_audiovolume_status = {prev_audiovolume_status}")
+
+    topic = f"{stat_topic}/volume"
+    logging.debug(f"stat_volume() @ topic = {topic}")
+    
+    pactl_output = subprocess.check_output("/usr/bin/pactl get-sink-volume @DEFAULT_SINK@ | /usr/bin/grep 'Volume:' |  /usr/bin/sed -e 's,.* \([0-9][0-9]*\)%.*,\\1,'", shell=True, universal_newlines=True).strip()
+    logging.debug(f"stat_volume() @ pactl_output = {pactl_output}")
+
+    if pactl_output != prev_audiovolume_status:
+        prev_audiovolume_status = pactl_output
+        logging.info(f"Volume is {pactl_output}%")
+        mqtt_client.publish(topic, pactl_output, retain=True)
+        logging.info(f"Published to: {topic} \"{pactl_output}\"")
+        
+def homeassistant_discovery_volume():
+    logging.debug(f"homeassistant_discovery_volume() started")
+    
+    topic = get_ha_discovery_topic("number", "volume")
+    logging.debug(f"homeassistant_discovery_volume() @ topic = {topic}")
+
+    message = f'\u007b"name": "volume", "state_topic": "{stat_topic}/volume", "command_topic": "{cmnd_topic}/volume", "unit_of_measurement": "%", "icon": "mdi:volume-high", "min": 0, "max": 100, "unique_id": "{hostname}_volume", "device": {ha_device}\u007d'
+    logging.debug(f"homeassistant_discovery_volume() @ message = {message}")
+    
+    mqtt_client.publish(topic, message, retain=True)
+    logging.info(f"HomeAssistant discovery message sent with volume config")
+
+# Notifications
+def cmnd_notify(command):
+    logging.debug(f"cmnd_notify() started")
+    logging.debug(f"cmnd_notify() @ command = {command}")
+    notify_proxy = session_bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
+    notify_proxy.Notify(
+        "mrcld", #app name
+        0, #replaces (0 = not relevant)
+        "", #icon name / path
+        "Home Assistant", # title
+        command, # body
+        [], # actions
+        {}, #hints
+        5000, #timeout. 0 = indefinite
+        dbus_interface="org.freedesktop.Notifications")
+
+# Shutdown system    
+def cmnd_shutdown():
+    os.system("systemctl poweroff")
+    
+def homeassistant_discovery_shutdown():
+    logging.debug(f"homeassistant_discovery_shutdown() started")
+    
+    topic = f"{ha_discovery_topic_prefix}/button/shutdown/{hostname}/config"
+    logging.debug(f"homeassistant_discovery_shutdown() @ topic = {topic}")
+
+    message = f'\u007b"name": "shutdown", "command_topic": "{cmnd_topic}/shutdown", "icon": "mdi:power", "unique_id": "{hostname}_shutdown", "device": {ha_device}\u007d'
+    logging.debug(f"homeassistant_discovery_shutdown() @ message = {message}")
+    
+    mqtt_client.publish(topic, message, retain=True)
+    logging.info(f"HomeAssistant discovery message sent with shutdown config")
+
+
+def main(config_file):
+    config = load_config(config_file)
+    
+    logging.basicConfig(filename=log_file, level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    logging.debug(f"---- DEBUG log level ----")
+    logging.info(f"mrcld - MQTT Remote Control for Linux Desktop is started by {username}")
+    
+    logging.debug(f"ha_discovery_topic_prefix = {ha_discovery_topic_prefix}")
+    logging.debug(f"ha_device_name = {ha_device_name}")
+    logging.debug(f"ha_device = {ha_device}")
+    
+    logging.debug(f"cmnd_topic = {cmnd_topic}")
+    logging.debug(f"stat_topic = {stat_topic}")
+    
+    logging.debug(f"screenlock_enabled = {screenlock_enabled}")
+    logging.debug(f"screenlock_ha_discovery_enabled = {screenlock_ha_discovery_enabled}")
+    
+    logging.debug(f"screenbacklight_enabled = {screenbacklight_enabled}")
+    logging.debug(f"screenbacklight_ha_discovery_enabled = {screenbacklight_ha_discovery_enabled}")
+    
+    logging.debug(f"audiovolume_enabled = {audiovolume_enabled}")
+    logging.debug(f"audiovolume_ha_discovery_enabled = {audiovolume_ha_discovery_enabled}")
+    
+    logging.debug(f"shutdown_enabled = {shutdown_enabled}")
+    logging.debug(f"shutdown_ha_discovery_enabled = {shutdown_ha_discovery_enabled}")
+    
+    mqtt_client.on_message = on_message
+
+    while True:
+        try:
+            # Próbálkozás a csatlakozással
+            mqtt_client.connect(broker_address)
+            mqtt_client.subscribe(f"{cmnd_topic}/+")
+            logging.info(f"Subsribed to: {cmnd_topic}")
+            mqtt_client.loop_start()  # loop_start() folyamatosan figyeli az üzeneteket
+            #if username != "root":
+
+            if screenlock_enabled and screenlock_ha_discovery_enabled:
+                homeassistant_discovery_screenlock()
+
+            if screenbacklight_enabled and screenbacklight_ha_discovery_enabled:
+                homeassistant_discovery_screenbacklight()
+
+            if audiovolume_enabled and audiovolume_ha_discovery_enabled:
+                homeassistant_discovery_volume()
+                
+            if shutdown_enabled and shutdown_ha_discovery_enabled:
+                homeassistant_discovery_shutdown()
+
+            while True:
+                if screenlock_enabled:
+                    stat_screenlock()
+                if screenbacklight_enabled:
+                    stat_screenbacklight()
+                if audiovolume_enabled:
+                    stat_volume()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            # Kilépés a programból, ha a felhasználó leállítja a futást (Ctrl+C)
+            break
+        except Exception as e:
+            logging.error(f"{str(e)}")
+            # Várakozás újrapróbálkozás előtt
+            time.sleep(10)  # Várakozás 10 másodpercig, majd újrapróbálkozás
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MQTT Remote Control for Linux Desktop")
+    parser.add_argument("--config", help="the path to the configuration file")
+    args = parser.parse_args()
+    
+    if args.config:
+        config_file = args.config
+    else:
+        if username == "root":
+            config_file = "/etc/mrcld.conf"
+        else:
+            config_file = f"{os.path.expanduser('~')}/.config/mrcld.conf"
+    
+    if os.path.isfile(config_file):
+        main(config_file)
+    else:
+        parser.print_help()
+        print(f"\nERROR: Config file does not exists! ({config_file})")
