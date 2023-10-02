@@ -108,6 +108,17 @@ def load_config(config_file):
         globals()["shutdown_enabled"] = False
         globals()["shutdown_ha_discovery_enabled"] = False
 
+    # Function: Reboot
+    if config.get('Function.Reboot', 'enable').lower() == "true":
+        globals()["reboot_enabled"] = True
+        if config.get('Function.Reboot', 'ha_discovery').lower() == "true":
+            globals()["reboot_ha_discovery_enabled"] = True
+        else:
+            globals()["reboot_ha_discovery_enabled"] = False
+    else:
+        globals()["reboot_enabled"] = False
+        globals()["reboot_ha_discovery_enabled"] = False
+
 
 def get_ha_discovery_topic(component, function):
     global ha_discovery_topic_prefix
@@ -138,6 +149,9 @@ def on_message(client, userdata, message):
         case "/shutdown":
             if shutdown_enabled:
                 cmnd_shutdown()
+        case "/reboot":
+            if reboot_enabled:
+                cmnd_reboot()
 
 # Screenlock functions          
 def cmnd_screenlock(command):
@@ -305,7 +319,7 @@ def cmnd_shutdown():
 def homeassistant_discovery_shutdown():
     logging.debug(f"homeassistant_discovery_shutdown() started")
     
-    topic = f"{ha_discovery_topic_prefix}/button/shutdown/{hostname}/config"
+    topic = get_ha_discovery_topic("button", "shutdown")
     logging.debug(f"homeassistant_discovery_shutdown() @ topic = {topic}")
 
     message = f'\u007b"name": "shutdown", "command_topic": "{cmnd_topic}/shutdown", "icon": "mdi:power", "unique_id": "{hostname}_shutdown", "device": {ha_device}\u007d'
@@ -313,6 +327,23 @@ def homeassistant_discovery_shutdown():
     
     mqtt_client.publish(topic, message, retain=True)
     logging.info(f"HomeAssistant discovery message sent with shutdown config")
+
+
+# Reboot system    
+def cmnd_reboot():
+    os.system("systemctl reboot")
+    
+def homeassistant_discovery_reboot():
+    logging.debug(f"homeassistant_discovery_reboot() started")
+    
+    topic = get_ha_discovery_topic("button", "reboot")
+    logging.debug(f"homeassistant_discovery_reboot() @ topic = {topic}")
+
+    message = f'\u007b"name": "reboot", "command_topic": "{cmnd_topic}/reboot", "icon": "mdi:restart", "unique_id": "{hostname}_reboot", "device": {ha_device}\u007d'
+    logging.debug(f"homeassistant_discovery_reboot() @ message = {message}")
+    
+    mqtt_client.publish(topic, message, retain=True)
+    logging.info(f"HomeAssistant discovery message sent with reboot config")
 
 
 def main(config_file):
@@ -342,6 +373,9 @@ def main(config_file):
     logging.debug(f"shutdown_enabled = {shutdown_enabled}")
     logging.debug(f"shutdown_ha_discovery_enabled = {shutdown_ha_discovery_enabled}")
     
+    logging.debug(f"reboot_enabled = {reboot_enabled}")
+    logging.debug(f"reboot_ha_discovery_enabled = {reboot_ha_discovery_enabled}")
+    
     mqtt_client.on_message = on_message
 
     while True:
@@ -364,6 +398,9 @@ def main(config_file):
                 
             if shutdown_enabled and shutdown_ha_discovery_enabled:
                 homeassistant_discovery_shutdown()
+                
+            if reboot_enabled and reboot_ha_discovery_enabled:
+                homeassistant_discovery_reboot()
 
             while True:
                 if screenlock_enabled:
