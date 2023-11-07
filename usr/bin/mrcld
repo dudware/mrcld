@@ -48,7 +48,10 @@ def load_config(config_file):
 
     # MQTT settings
     globals()["mqtt_client"] = mqtt.Client()
-
+    mqtt_client.on_connect  = on_connect
+    mqtt_client.on_disconnect = on_disconnect
+    mqtt_client.on_message = on_message
+    
     mqtt_username = config.get('MQTT', 'username')
     mqtt_password = config.get('MQTT', 'password')
     mqtt_client.username_pw_set(mqtt_username, mqtt_password)  # Felhasználónév-jelszó hitelesítés beállítása
@@ -118,6 +121,12 @@ def load_config(config_file):
     else:
         globals()["reboot_enabled"] = False
         globals()["reboot_ha_discovery_enabled"] = False
+        
+    # Function: Service Restart
+    if config.get('Function.ServiceRestart', 'enable').lower() == "true":
+        globals()["servicerestart_enabled"] = True
+    else:
+        globals()["servicerestart_enabled"] = False
 
 
 def get_ha_discovery_topic(component, function):
@@ -126,34 +135,87 @@ def get_ha_discovery_topic(component, function):
     topic = f"{ha_discovery_topic_prefix}/{component}/{function}/{ha_device_name}/config"
     return topic
 
-# Az üzenet érkezésekor végrehajtandó függvény
+
+##
+# MQTT client functions
+##
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logging.info(f"Successfully connected to {broker_address}")
+
+        mqtt_client.subscribe(f"{cmnd_topic}/+")
+        logging.info(f"Subsribed to: {cmnd_topic}")
+
+        if screenlock_enabled and screenlock_ha_discovery_enabled:
+            homeassistant_discovery_screenlock()
+
+        if screenbacklight_enabled and screenbacklight_ha_discovery_enabled:
+            homeassistant_discovery_screenbacklight()
+
+        if audiovolume_enabled and audiovolume_ha_discovery_enabled:
+            homeassistant_discovery_volume()
+                
+        if shutdown_enabled and shutdown_ha_discovery_enabled:
+            homeassistant_discovery_shutdown()
+                
+        if reboot_enabled and reboot_ha_discovery_enabled:
+            homeassistant_discovery_reboot()
+    else:
+        logging.error(f"Failed connection attempt for {broker_address} with error code {rc}")
+
+def on_disconnect(client, userdata, rc):
+    logging.warning(f"Connection lost. Try to reconnect...")
+    while True:
+        try:
+            mqtt_client.reconnect()  # Újracsatlakozás a brókerhez
+            break  # Kilépés a ciklusból, ha sikeres az újracsatlakozás
+        except Exception as e:
+            logging.warning(f"Connection failed. Next try in 5s. Reason: {e}")
+            time.sleep(5)  # Várakozás, majd próbálkozás újra 5 másodperc múlva
+
 def on_message(client, userdata, message):
-    # Az MQTT üzenet tartalmát konvertáljuk szövegbe
     command = message.payload.decode("utf-8")
     topic = message.topic.replace(cmnd_topic, '')
     logging.info(f"Received on: {cmnd_topic}{topic} \"{command}\"")
 
-    # Itt végrehajtjuk a parancsot
     match (topic):
         case "/screenlock":
             if screenlock_enabled:
                 cmnd_screenlock(command)
+            else:
+                logging.warning(f"Function ScreenLock is disabled")
         case "/screenbacklight":
             if screenbacklight_enabled:
                 cmnd_screenbacklight(command)
+            else:
+                logging.warning(f"Function ScreenBacklight is disabled")
         case "/volume":
             if audiovolume_enabled:
                 cmnd_volume(command)
+            else:
+                logging.warning(f"Function AudioVolume is disabled")
         case "/notify":
             cmnd_notify(command)
         case "/shutdown":
             if shutdown_enabled:
                 cmnd_shutdown()
+            else:
+                logging.warning(f"Function Shutdown is disabled")
         case "/reboot":
             if reboot_enabled:
                 cmnd_reboot()
+            else:
+                logging.warning(f"Function Reboot is disabled")
+        case "/restart_service":
+            if servicerestart_enabled:
+                cmnd_restart_service(command)
+            else:
+                logging.warning(f"Function ServiceRestart is disabled")
 
+
+##
 # Screenlock functions          
+##
 def cmnd_screenlock(command):
     logging.debug(f"cmnd_screenlock() started")
     logging.debug(f"cmnd_screenlock() @ command = {command}")
@@ -198,7 +260,9 @@ def homeassistant_discovery_screenlock():
     mqtt_client.publish(topic, message, retain=True)
     logging.info(f"HomeAssistant discovery message sent with screenlock config")
 
+##
 # Screen backlight functions
+##
 def cmnd_screenbacklight(command):
     logging.debug(f"cmnd_screenbacklight() started")
     logging.debug(f"cmnd_screenbacklight() @ command = {command}")
@@ -232,8 +296,7 @@ def stat_screenbacklight():
         case _:
             backlight_status = None
     logging.debug(f"stat_screenbacklight() @ backlight_status = {backlight_status}")
-    
-    # Is screen blacklight status changed?             
+
     if backlight_status != prev_screenbacklight_status:
         prev_screenbacklight_status = backlight_status
         logging.info(f"Screen backlight is {xsetq_output}")
@@ -251,8 +314,11 @@ def homeassistant_discovery_screenbacklight():
     
     mqtt_client.publish(topic, message, retain=True)
     logging.info(f"HomeAssistant discovery message sent with screenbacklight config")
-        
+
+
+##
 # Audio volume functions          
+##
 def cmnd_volume(command):
     logging.debug(f"cmnd_volume() started")
     logging.debug(f"cmnd_volume() @ command = {command}")
@@ -296,6 +362,7 @@ def homeassistant_discovery_volume():
     mqtt_client.publish(topic, message, retain=True)
     logging.info(f"HomeAssistant discovery message sent with volume config")
 
+
 # Notifications
 def cmnd_notify(command):
     logging.debug(f"cmnd_notify() started")
@@ -312,7 +379,9 @@ def cmnd_notify(command):
         5000, #timeout. 0 = indefinite
         dbus_interface="org.freedesktop.Notifications")
 
+##
 # Shutdown system    
+##
 def cmnd_shutdown():
     os.system("systemctl poweroff")
     
@@ -329,7 +398,9 @@ def homeassistant_discovery_shutdown():
     logging.info(f"HomeAssistant discovery message sent with shutdown config")
 
 
+##
 # Reboot system    
+##
 def cmnd_reboot():
     os.system("systemctl reboot")
     
@@ -344,6 +415,13 @@ def homeassistant_discovery_reboot():
     
     mqtt_client.publish(topic, message, retain=True)
     logging.info(f"HomeAssistant discovery message sent with reboot config")
+
+
+##
+# Restart service 
+##
+def cmnd_restart_service(service):
+    os.system(f"systemctl restart {service}")
 
 
 def main(config_file):
@@ -376,47 +454,27 @@ def main(config_file):
     logging.debug(f"reboot_enabled = {reboot_enabled}")
     logging.debug(f"reboot_ha_discovery_enabled = {reboot_ha_discovery_enabled}")
     
-    mqtt_client.on_message = on_message
+    logging.debug(f"servicerestart_enabled = {servicerestart_enabled}")
 
     while True:
         try:
-            # Próbálkozás a csatlakozással
-            mqtt_client.connect(broker_address)
-            mqtt_client.subscribe(f"{cmnd_topic}/+")
-            logging.info(f"Subsribed to: {cmnd_topic}")
-            mqtt_client.loop_start()  # loop_start() folyamatosan figyeli az üzeneteket
-            #if username != "root":
-
-            if screenlock_enabled and screenlock_ha_discovery_enabled:
-                homeassistant_discovery_screenlock()
-
-            if screenbacklight_enabled and screenbacklight_ha_discovery_enabled:
-                homeassistant_discovery_screenbacklight()
-
-            if audiovolume_enabled and audiovolume_ha_discovery_enabled:
-                homeassistant_discovery_volume()
-                
-            if shutdown_enabled and shutdown_ha_discovery_enabled:
-                homeassistant_discovery_shutdown()
-                
-            if reboot_enabled and reboot_ha_discovery_enabled:
-                homeassistant_discovery_reboot()
+            mqtt_client.connect(broker_address, keepalive=5)
+            mqtt_client.loop_start() 
 
             while True:
-                if screenlock_enabled:
-                    stat_screenlock()
-                if screenbacklight_enabled:
-                    stat_screenbacklight()
-                if audiovolume_enabled:
-                    stat_volume()
+                if mqtt_client.is_connected():
+                    if screenlock_enabled:
+                        stat_screenlock()
+                    if screenbacklight_enabled:
+                        stat_screenbacklight()
+                    if audiovolume_enabled:
+                        stat_volume()
                 time.sleep(1)
         except KeyboardInterrupt:
-            # Kilépés a programból, ha a felhasználó leállítja a futást (Ctrl+C)
             break
         except Exception as e:
-            logging.error(f"{str(e)}")
-            # Várakozás újrapróbálkozás előtt
-            time.sleep(10)  # Várakozás 10 másodpercig, majd újrapróbálkozás
+            logging.error(f"Failed connection attempt for {broker_address}. Reason: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MQTT Remote Control for Linux Desktop")
