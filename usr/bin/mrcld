@@ -9,6 +9,7 @@ import dbus
 import subprocess
 import configparser
 import argparse
+import re
 
 hostname = socket.gethostname()
 username = getpass.getuser()
@@ -19,7 +20,7 @@ def load_config(config_file):
 
     # Logger settings
     log_dir = config.get('General', 'log_dir')
-    globals()["log_file"] = f"{log_dir}/daemon-{username}.log"
+    globals()["log_file"] = f"{log_dir}/{username}.log"
 
     log_level_string = config.get('General', 'log_level', fallback="info").upper()
     log_levels = {
@@ -62,6 +63,8 @@ def load_config(config_file):
     
 
     # Function: ScreenLock
+#    globals()["ScreenLock"]=config["Function.ScreenLock"]
+#    if ScreenLock.getboolean("enable"):
     if config.get('Function.ScreenLock', 'enable').lower() == "true":
         globals()["screenlock_enabled"] = True
         globals()["prev_lock_status"] = None
@@ -72,7 +75,7 @@ def load_config(config_file):
     else:
         globals()["screenlock_enabled"] = False
         globals()["screenlock_ha_discovery_enabled"] = False
-        
+
     # Function: ScreenBacklight
     if config.get('Function.ScreenBacklight', 'enable').lower() == "true":
         globals()["screenbacklight_enabled"] = True
@@ -121,12 +124,18 @@ def load_config(config_file):
     else:
         globals()["reboot_enabled"] = False
         globals()["reboot_ha_discovery_enabled"] = False
-        
-    # Function: Service Restart
-    if config.get('Function.ServiceRestart', 'enable').lower() == "true":
-        globals()["servicerestart_enabled"] = True
-    else:
-        globals()["servicerestart_enabled"] = False
+
+    #Systemd services
+    globals()["systemd_services"] = {}
+    for section in config.sections():
+        if section.startswith("Systemd."):
+            unit = config[section]
+            service = unit["service"]
+            enable = unit.getboolean("enable")
+            ha_discovery = unit.getboolean("ha_discovery")
+            if enable:
+                systemd_services[service] = {}
+                systemd_services[service]["ha_discovery"] = ha_discovery
 
 
 def get_ha_discovery_topic(component, function):
@@ -140,6 +149,8 @@ def get_ha_discovery_topic(component, function):
 # MQTT client functions
 ##
 def on_connect(client, userdata, flags, rc):
+    global systemd_services
+
     if rc == 0:
         logging.info(f"Successfully connected to {broker_address}")
 
@@ -160,6 +171,10 @@ def on_connect(client, userdata, flags, rc):
                 
         if reboot_enabled and reboot_ha_discovery_enabled:
             homeassistant_discovery_reboot()
+        
+        for service in systemd:
+            systemd[service].send_discovery()
+        
     else:
         logging.error(f"Failed connection attempt for {broker_address} with error code {rc}")
 
@@ -206,12 +221,11 @@ def on_message(client, userdata, message):
                 cmnd_reboot()
             else:
                 logging.warning(f"Function Reboot is disabled")
-        case "/restart_service":
-            if servicerestart_enabled:
-                cmnd_restart_service(command)
-            else:
-                logging.warning(f"Function ServiceRestart is disabled")
-
+        case _:
+            if re.match(r"\/systemd_\w", topic):
+                service = topic.replace("/systemd_","")
+                if service in systemd:
+                    systemd[service].command(command.lower())
 
 ##
 # Screenlock functions          
@@ -418,10 +432,53 @@ def homeassistant_discovery_reboot():
 
 
 ##
-# Restart service 
+# Systemd    
 ##
-def cmnd_restart_service(service):
-    os.system(f"systemctl restart {service}")
+class Systemd:
+    def __init__ (self, name, ha_discovery):
+        self.name = name
+        self.ha_discovery = ha_discovery
+        self.prev_status = None
+        logging.debug(f"Systemd object created for {self.name}")
+
+    def command(self, command):
+        logging.debug(f"Systemd.command() - {self.name} @ command = {command}")
+        print(command)
+        if command in ["start","stop","restart"]:
+            os.system(f"systemctl {command} {self.name}")
+    
+    def send_state(self):
+        topic = f"{stat_topic}/systemd_{self.name}"
+        logging.debug(f"Systemd.send_state() - {self.name} @ topic = {topic}")
+        
+        status = os.system(f"systemctl is-active --quiet {self.name}")
+        logging.debug(f"Systemd.send_state() - {self.name} @ service status = {status}")
+        
+        if status != self.prev_status:
+            self.prev_status = status
+            mqtt_client.publish(topic, status, retain=True)
+            logging.info(f"Published to: {topic} \"{status}\"")
+
+    def send_discovery(self):
+        if self.ha_discovery:
+            global ha_discovery_topic_prefix
+            global ha_device_name
+
+            # Switch config
+            topic = f"{ha_discovery_topic_prefix}/switch/systemd_{self.name}/{ha_device_name}/config"
+            logging.debug(f"Systemd.send_discovery() - {self.name} @ topic = {topic}")
+            message = f'\u007b"name": "Systemd: {self.name}", "device_class": "switch", "state_topic": "{stat_topic}/systemd_{self.name}", "command_topic": "{cmnd_topic}/systemd_{self.name}", "icon": "mdi:cog-outline", "payload_on": "start", "payload_off": "stop", "stat_on": "0", "stat_off": "768", "optimistic": "true", "unique_id": "{hostname}_systemd_{self.name}", "device": {ha_device}\u007d'
+            logging.debug(f"Systemd.send_discovery() - {self.name} @ message = {message}")
+            mqtt_client.publish(topic, message, retain=True)
+
+            # Button config
+            topic = f"{ha_discovery_topic_prefix}/button/systemd_{self.name}/{ha_device_name}/config"
+            logging.debug(f"Systemd.send_discovery() - {self.name} @ topic = {topic}")
+            message = f'\u007b"name": "Systemd: {self.name} restart", "device_class": "button","command_topic": "{cmnd_topic}/systemd_{self.name}", "icon": "mdi:cog-outline", "payload": "restart", "unique_id": "{hostname}_systemd_{self.name}", "device": {ha_device}\u007d'
+            logging.debug(f"Systemd.send_discovery() - {self.name} @ message = {message}")
+            mqtt_client.publish(topic, message, retain=True)
+
+            logging.info(f"HomeAssistant discovery message sent with {self.name} Systemd unit config")
 
 
 def main(config_file):
@@ -438,7 +495,7 @@ def main(config_file):
     
     logging.debug(f"cmnd_topic = {cmnd_topic}")
     logging.debug(f"stat_topic = {stat_topic}")
-    
+
     logging.debug(f"screenlock_enabled = {screenlock_enabled}")
     logging.debug(f"screenlock_ha_discovery_enabled = {screenlock_ha_discovery_enabled}")
     
@@ -454,7 +511,9 @@ def main(config_file):
     logging.debug(f"reboot_enabled = {reboot_enabled}")
     logging.debug(f"reboot_ha_discovery_enabled = {reboot_ha_discovery_enabled}")
     
-    logging.debug(f"servicerestart_enabled = {servicerestart_enabled}")
+    globals()["systemd"] = {}
+    for unit in systemd_services:
+        systemd[unit] = Systemd(unit, systemd_services[unit]["ha_discovery"])
 
     while True:
         try:
@@ -469,6 +528,8 @@ def main(config_file):
                         stat_screenbacklight()
                     if audiovolume_enabled:
                         stat_volume()
+                    for service in systemd.keys():
+                        systemd[service].send_state()
                 time.sleep(1)
         except KeyboardInterrupt:
             break
